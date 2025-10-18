@@ -4,7 +4,7 @@ CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2
 LDFLAGS := -lws2_32
 
-SRC := main.cpp ServerConnection.cpp FileConfig.cpp
+SRC := main.cpp ServerConnection.cpp FileConfig.cpp Message.cpp
 OBJ := $(SRC:.cpp=.o)
 TARGET := client.exe
 

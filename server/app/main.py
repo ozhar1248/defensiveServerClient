@@ -1,6 +1,6 @@
-# main.py
-from server_socket import PortServer
+# app/main.py
 from file_config import PortConfig
+from network.server_socket import PortServer
 
 def main():
     port = PortConfig().get_port()
