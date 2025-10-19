@@ -2,7 +2,7 @@
 from __future__ import annotations
 import sqlite3
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 from datetime import datetime, timezone
 
 _DB_FILE = "defensive.db"
@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS Clients (
     ID INTEGER PRIMARY KEY AUTOINCREMENT,
     username   TEXT NOT NULL UNIQUE,
     publicKey  TEXT,
-    lastSeen   TEXT
+    lastSeen   TEXT,
+    uniqueId   BLOB UNIQUE
 );
 """
 
@@ -30,14 +31,13 @@ CREATE TABLE IF NOT EXISTS Messages (
 """
 
 class Database:
-    """Single entry point for DB access. Responsible for connection + schema + queries."""
+    """Single entry point for DB access."""
     def __init__(self, base_dir: Optional[Path] = None, db_filename: str = _DB_FILE):
         base = base_dir or Path(__file__).resolve().parent.parent  # server_py/
         self.db_path = (base / db_filename) if not Path(db_filename).is_absolute() else Path(db_filename)
         self._conn: Optional[sqlite3.Connection] = None
 
     def connect(self) -> None:
-        # Create file if missing (sqlite does this on connect)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._ensure_schema()
@@ -52,44 +52,39 @@ class Database:
         cur = self._conn.cursor()
         cur.execute(_CREATE_CLIENTS)
         cur.execute(_CREATE_MESSAGES)
+        # Minimal migration: ensure 'uniqueId' exists
+        cur.execute("PRAGMA table_info(Clients)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "uniqueId" not in cols:
+            cur.execute("ALTER TABLE Clients ADD COLUMN uniqueId BLOB UNIQUE")
         self._conn.commit()
 
     # ----- Client ops -----
-    def upsert_client(self, username: str, public_key: Optional[str] = None) -> int:
-        """
-        Ensure a client exists; update lastSeen and publicKey (if provided).
-        Return client ID.
-        """
+    def username_exists(self, username: str) -> bool:
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute("SELECT 1 FROM Clients WHERE username = ?", (username,))
+        return cur.fetchone() is not None
+
+    def insert_client_with_uuid(self, username: str, public_key: str, unique_id_bytes: bytes) -> int:
         assert self._conn is not None
         now = datetime.now(timezone.utc).isoformat()
         cur = self._conn.cursor()
-        # Try insert
-        try:
-            cur.execute(
-                "INSERT INTO Clients (username, publicKey, lastSeen) VALUES (?, ?, ?)",
-                (username, public_key, now)
-            )
-            self._conn.commit()
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
-            # Already exists -> update lastSeen (+ publicKey if given)
-            if public_key is not None:
-                cur.execute(
-                    "UPDATE Clients SET publicKey = ?, lastSeen = ? WHERE username = ?",
-                    (public_key, now, username)
-                )
-            else:
-                cur.execute(
-                    "UPDATE Clients SET lastSeen = ? WHERE username = ?",
-                    (now, username)
-                )
-            self._conn.commit()
-            # fetch ID
-            cur.execute("SELECT ID FROM Clients WHERE username = ?", (username,))
-            row = cur.fetchone()
-            return int(row[0]) if row else -1
+        cur.execute(
+            "INSERT INTO Clients (username, publicKey, lastSeen, uniqueId) VALUES (?,?,?,?)",
+            (username, public_key, now, unique_id_bytes)
+        )
+        self._conn.commit()
+        return cur.lastrowid
 
-    def update_last_seen(self, client_id: int) -> None:
+    def get_client_id_by_uuid(self, unique_id_bytes: bytes) -> Optional[int]:
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute("SELECT ID FROM Clients WHERE uniqueId = ?", (unique_id_bytes,))
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+
+    def update_last_seen_by_id(self, client_id: int) -> None:
         assert self._conn is not None
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute("UPDATE Clients SET lastSeen = ? WHERE ID = ?", (now, client_id))
@@ -98,23 +93,29 @@ class Database:
     # ----- Message ops -----
     def insert_message(self, to_client_id: Optional[int], from_client_id: int,
                        msg_type: str, content: str) -> int:
-        """
-        Insert a message record. to_client_id may be None for server-only ack/logging.
-        """
         assert self._conn is not None
         created_at = datetime.now(timezone.utc).isoformat()
         cur = self._conn.cursor()
         cur.execute(
-            "INSERT INTO Messages (toClient, fromClient, type, content, createdAt) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO Messages (toClient, fromClient, type, content, createdAt) VALUES (?,?,?,?,?)",
             (to_client_id, from_client_id, msg_type, content, created_at)
         )
         self._conn.commit()
         return cur.lastrowid
+    
+    def get_clients_excluding_uuid(self, exclude_unique_id: bytes):
+        """Return list of (uniqueId_bytes, username) excluding the given unique id."""
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT uniqueId, username FROM Clients WHERE uniqueId IS NOT NULL AND uniqueId != ? ORDER BY username ASC",
+            (exclude_unique_id,)
+        )
+        return [(bytes(row[0]), row[1]) for row in cur.fetchall()]
 
-    # Context manager helpers
+    # Context manager
     def __enter__(self) -> "Database":
         self.connect()
         return self
-
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()

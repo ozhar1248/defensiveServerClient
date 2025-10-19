@@ -2,41 +2,44 @@
 import socket
 import threading
 from data.db import Database
+from protocol.server_protocol import (
+    read_client_request, build_server_response,
+    CODE_REGISTRATION_REQ, CODE_REGISTRATION_OK, CODE_ERROR,
+    CODE_CLIENTS_LIST_REQ, CODE_CLIENTS_LIST_OK,
+    handle_registration, handle_clients_list
+)
 
 class ClientHandler(threading.Thread):
     def __init__(self, conn: socket.socket, addr):
         super().__init__(daemon=True)
         self.conn = conn
-        self.addr = addr  # (ip, port)
+        self.addr = addr
 
     def run(self):
-        username = f"{self.addr[0]}:{self.addr[1]}"  # placeholder until we add auth
-        print(f"[+] Client connected: {username}", flush=True)
-
-        # Open a DB connection for this thread
-        with Database() as db:
-            client_id = db.upsert_client(username=username)
-
+        print(f"[+] Client connected: {self.addr}", flush=True)
+        with Database() as db, self.conn:
             try:
-                with self.conn:
-                    while True:
-                        data = self.conn.recv(4096)
-                        if not data:
-                            print(f"[-] Client disconnected: {username}", flush=True)
-                            break
+                while True:
+                    try:
+                        req = read_client_request(self.conn)
+                    except ConnectionError:
+                        print(f"[-] Client disconnected: {self.addr}", flush=True)
+                        break
 
-                        msg = data.decode("utf-8", errors="replace").rstrip("\r\n")
-                        print(f"Message received from {username}: {msg}", flush=True)
+                    if req.code == CODE_REGISTRATION_REQ:
+                        resp = handle_registration(db, req.payload)
+                    elif req.code == CODE_CLIENTS_LIST_REQ:
+                        # use the 16-byte client id from header to exclude the requester
+                        requester_uuid = req.client_id
+                        resp = handle_clients_list(db, requester_uuid)
+                    else:
+                        resp = type("R", (), {"version":2,"code":CODE_ERROR,"payload":b""})()
 
-                        # Store message (from this client -> no 'to' specified yet)
-                        db.insert_message(to_client_id=None, from_client_id=client_id,
-                                          msg_type="text", content=msg)
-                        db.update_last_seen(client_id)
+                    raw = build_server_response(resp.code, resp.payload)
+                    self.conn.sendall(raw)
 
-                        # Ack back to client
-                        self.conn.sendall(f"Your message '{msg}' was accepted\n".encode("utf-8"))
             except Exception as e:
-                print(f"[!] Error with {username}: {e}", flush=True)
+                print(f"[!] Error with {self.addr}: {e}", flush=True)
 
 class PortServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 1357, backlog: int = 50):

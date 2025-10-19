@@ -1,10 +1,9 @@
 # === Makefile for client_cpp project ===
-
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2
 LDFLAGS := -lws2_32
 
-SRC := main.cpp ServerConnection.cpp FileConfig.cpp Message.cpp
+SRC := main.cpp ServerConnection.cpp FileConfig.cpp Message.cpp Protocol.cpp
 OBJ := $(SRC:.cpp=.o)
 TARGET := client.exe
 
