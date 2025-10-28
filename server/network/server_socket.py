@@ -4,9 +4,11 @@ import threading
 from data.db import Database
 from protocol.server_protocol import (
     read_client_request, build_server_response,
-    CODE_REGISTRATION_REQ, CODE_REGISTRATION_OK, CODE_ERROR,
-    CODE_CLIENTS_LIST_REQ, CODE_CLIENTS_LIST_OK,
-    handle_registration, handle_clients_list
+    CODE_REGISTRATION_REQ, CODE_CLIENTS_LIST_REQ, CODE_PUBLIC_KEY_REQ,
+    CODE_SEND_MESSAGE_REQ, CODE_PULL_WAITING_REQ,
+    CODE_ERROR,
+    handle_registration, handle_clients_list, handle_public_key_request,
+    handle_send_message, handle_pull_waiting
 )
 
 class ClientHandler(threading.Thread):
@@ -29,14 +31,16 @@ class ClientHandler(threading.Thread):
                     if req.code == CODE_REGISTRATION_REQ:
                         resp = handle_registration(db, req.payload)
                     elif req.code == CODE_CLIENTS_LIST_REQ:
-                        # use the 16-byte client id from header to exclude the requester
-                        requester_uuid = req.client_id
-                        resp = handle_clients_list(db, requester_uuid)
+                        resp = handle_clients_list(db, req.client_id)
+                    elif req.code == CODE_PUBLIC_KEY_REQ:
+                        resp = handle_public_key_request(db, req.payload)
+                    elif req.code == CODE_SEND_MESSAGE_REQ:
+                        resp = handle_send_message(db, req.client_id, req.payload)
+                    elif req.code == CODE_PULL_WAITING_REQ:
+                        resp = handle_pull_waiting(db, req.client_id)
                     else:
                         resp = type("R", (), {"version":2,"code":CODE_ERROR,"payload":b""})()
-
-                    raw = build_server_response(resp.code, resp.payload)
-                    self.conn.sendall(raw)
+                    self.conn.sendall(build_server_response(resp.code, resp.payload))
 
             except Exception as e:
                 print(f"[!] Error with {self.addr}: {e}", flush=True)

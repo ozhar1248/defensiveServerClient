@@ -18,14 +18,24 @@ CODE_ERROR            = 9000
 CODE_CLIENTS_LIST_REQ = 601
 CODE_CLIENTS_LIST_OK  = 2101
 
+CODE_SEND_MESSAGE_REQ  = 603
+CODE_SEND_MESSAGE_OK   = 2103
+
+CODE_PULL_WAITING_REQ  = 604
+CODE_PULL_WAITING_OK   = 2104
+
 # Payload sizes for registration
 REG_NAME_LEN = 255
-REG_PUBKEY_LEN = 150
+REG_PUBKEY_LEN = 160
 REG_PAYLOAD_LEN = REG_NAME_LEN + REG_PUBKEY_LEN
 
 ENTRY_UUID_LEN = 16
 ENTRY_NAME_LEN = 255
 ENTRY_TOTAL = ENTRY_UUID_LEN + ENTRY_NAME_LEN  # 271
+
+CODE_PUBLIC_KEY_REQ   = 602
+CODE_PUBLIC_KEY_OK    = 2102
+PUBKEY_RESP_KEY_LEN   = 160  # response key length per spec
 
 @dataclass
 class ClientRequest:
@@ -103,3 +113,58 @@ def handle_clients_list(db: Database, requester_uuid: bytes) -> ServerResponse:
         return ServerResponse(SERVER_VERSION, CODE_CLIENTS_LIST_OK, payload)
     except Exception:
         return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+
+def handle_send_message(db: Database, requester_uuid: bytes, payload: bytes) -> ServerResponse:
+    # Payload: destClientId(16) + msgType(1) + contentSize(4 LE) + content
+    if len(payload) < 16 + 1 + 4:
+        return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+    dest_uuid = payload[:16]
+    msg_type = payload[16]
+    content_size = struct.unpack("<I", payload[17:21])[0]
+    if content_size < 0 or len(payload) != 16 + 1 + 4 + content_size:
+        return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+    content = payload[21:]
+
+    to_rowid = db.get_rowid_by_uuid(dest_uuid)
+    from_rowid = db.get_rowid_by_uuid(requester_uuid)
+    if to_rowid is None or from_rowid is None:
+        return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+
+    mid = db.save_message(to_rowid, from_rowid, int(msg_type), content)
+    # Response payload: ClientID(16 dest) + MessageID(4 LE)
+    resp = dest_uuid + struct.pack("<I", mid)
+    return ServerResponse(SERVER_VERSION, CODE_SEND_MESSAGE_OK, resp)
+
+def handle_pull_waiting(db: Database, requester_uuid: bytes) -> ServerResponse:
+    to_rowid = db.get_rowid_by_uuid(requester_uuid)
+    if to_rowid is None:
+        return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+
+    rows = db.get_waiting_messages_for(to_rowid)
+    parts = []
+    for msg_id, from_rowid, msg_type, content in rows:
+        from_uuid = db.get_uuid_by_rowid(from_rowid)
+        if not from_uuid:
+            continue
+        parts.append(from_uuid)                  # 16
+        parts.append(struct.pack("<I", msg_id))  # 4
+        parts.append(struct.pack("<B", int(msg_type))) # 1
+        parts.append(struct.pack("<I", len(content)))  # 4
+        parts.append(content)                    # N
+    payload = b"".join(parts)
+    return ServerResponse(SERVER_VERSION, CODE_PULL_WAITING_OK, payload)
+
+def handle_public_key_request(db: Database, payload: bytes) -> ServerResponse:
+    # payload must be exactly 16 bytes: target client's unique ID
+    if len(payload) != 16:
+        return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+    target_uid = payload
+    pk = db.get_public_key_by_uuid(target_uid)
+    if pk is None:
+        return ServerResponse(SERVER_VERSION, CODE_ERROR, b"")
+    pk_bytes = pk.encode("ascii", errors="ignore")
+    field = bytearray(PUBKEY_RESP_KEY_LEN)
+    n = min(len(pk_bytes), PUBKEY_RESP_KEY_LEN)
+    field[:n] = pk_bytes[:n]
+    resp_payload = target_uid + bytes(field)
+    return ServerResponse(SERVER_VERSION, CODE_PUBLIC_KEY_OK, resp_payload)

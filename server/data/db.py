@@ -113,6 +113,56 @@ class Database:
         )
         return [(bytes(row[0]), row[1]) for row in cur.fetchall()]
 
+    def get_rowid_by_uuid(self, unique_id_bytes: bytes) -> Optional[int]:
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute("SELECT ID FROM Clients WHERE uniqueId = ?", (unique_id_bytes,))
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+
+    def get_uuid_by_rowid(self, client_rowid: int) -> Optional[bytes]:
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute("SELECT uniqueId FROM Clients WHERE ID = ?", (client_rowid,))
+        row = cur.fetchone()
+        return bytes(row[0]) if row and row[0] is not None else None
+    
+    def get_public_key_by_uuid(self, unique_id_bytes: bytes) -> Optional[str]:
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute("SELECT publicKey FROM Clients WHERE uniqueId = ?", (unique_id_bytes,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def save_message(self, to_client_rowid: int, from_client_rowid: int,
+                     msg_type: int, content: bytes) -> int:
+        assert self._conn is not None
+        created_at = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO Messages (toClient, fromClient, type, content, createdAt) VALUES (?,?,?,?,?)",
+            (to_client_rowid, from_client_rowid, str(msg_type), sqlite3.Binary(content), created_at)
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def get_waiting_messages_for(self, to_client_rowid: int):
+        """Return list of rows for a recipient, then delete them."""
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT ID, fromClient, type, content FROM Messages WHERE toClient = ? ORDER BY ID ASC",
+            (to_client_rowid,)
+        )
+        rows = cur.fetchall()
+        # delete after fetch
+        if rows:
+            ids = [r[0] for r in rows]
+            qmarks = ",".join("?" for _ in ids)
+            cur.execute(f"DELETE FROM Messages WHERE ID IN ({qmarks})", ids)
+            self._conn.commit()
+        return rows
+
     # Context manager
     def __enter__(self) -> "Database":
         self.connect()
