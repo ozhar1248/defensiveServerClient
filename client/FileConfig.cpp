@@ -57,7 +57,6 @@ static array<uint8_t,16> hexToBytes16(const string& hex) {
     return out;
 }
 
-// read my.info
 // Read full my.info (username, id, base64 private key)
 std::tuple<std::string, std::array<uint8_t,16>, std::string>
 FileConfig::readFullMyInfo() {
@@ -109,7 +108,7 @@ string FileConfig::generateAndSavePrivateKey(const string& username,
 
     // Base64-encode DER
     std::string base64;
-    CryptoPP::Base64Encoder encoder(new CryptoPP::StringSink(base64), false /*do not insert line breaks*/);
+    CryptoPP::Base64Encoder encoder(new CryptoPP::StringSink(base64), false);
     queue.CopyTo(encoder);
     encoder.MessageEnd();
 
@@ -117,6 +116,11 @@ string FileConfig::generateAndSavePrivateKey(const string& username,
     writeMyInfo(username, clientId, base64);
 
     return base64;
+}
+
+bool FileConfig::myInfoExists() {
+    auto path = exeDir() / "my.info";
+    return std::filesystem::exists(path);
 }
 
 

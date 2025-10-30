@@ -3,7 +3,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -IC:/libs/cryptopp/include
 LDFLAGS := -LC:/libs/cryptopp/cryptopp-master -lcryptopp -lws2_32
 # If you moved the lib: -LC:/libs/cryptopp/libcryptopp instead
 
-SRC := main.cpp ServerConnection.cpp FileConfig.cpp Message.cpp Protocol.cpp Encryption.cpp
+SRC := main.cpp ServerConnection.cpp FileConfig.cpp Message.cpp Protocol.cpp Encryption.cpp Utils.cpp
 
 OBJ := $(SRC:.cpp=.o)
 TARGET := client.exe

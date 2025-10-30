@@ -108,9 +108,6 @@ std::vector<uint8_t> Encryption::RsaEncryptOaepWithBase64Pub(
     StringSource ss(plain.data(), plain.size(), true,
                     new PK_EncryptorFilter(prng, enc, new StringSink(cipher)));
 
-    // debug
-    std::cerr << "[DBG] pub DER len: " << der.size() << "\n";
-    // end debug
     return std::vector<uint8_t>(cipher.begin(), cipher.end());
 }
 
@@ -125,9 +122,6 @@ std::vector<uint8_t> Encryption::RsaDecryptOaepWithBase64Priv(
         // Base64 decode DER bytes
         std::string der;
         StringSource b64(asciiBase64DerPrivate, true, new Base64Decoder(new StringSink(der)));
-        // DEBUG
-        std::cerr << "[DBG] priv DER len: " << der.size() << "\n";
-        // END DEBUG
 
         ByteQueue q;
         q.Put(reinterpret_cast<const byte *>(der.data()), der.size());
@@ -150,13 +144,11 @@ std::vector<uint8_t> Encryption::RsaDecryptOaepWithBase64Priv(
     catch (const CryptoPP::Exception &e)
     {
         ok = false;
-        std::cerr << "[DBG] Crypto++ decrypt exception: " << e.what() << "\n";
         return {};
     }
     catch (...)
     {
         ok = false;
-        std::cerr << "[DBG] Crypto++ decrypt exception: unknown\n";
         return {};
     }
 }

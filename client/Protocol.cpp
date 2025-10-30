@@ -92,3 +92,57 @@ std::vector<uint8_t> Protocol::buildPullWaitingReq(
     append_u32_le(msg, 0);
     return msg;
 }
+
+// helpers to read little-endian
+static uint32_t rd_u32_le(const uint8_t* p){
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+bool Protocol::isOk(const ServerReply& r, uint16_t expectedCode) {
+    return r.version == SERVER_VERSION_EXPECTED && r.code == expectedCode;
+}
+
+std::vector<ClientEntry> Protocol::parseClientsListPayload(const std::vector<uint8_t>& payload) {
+    std::vector<ClientEntry> out;
+    if (payload.size() % ENTRY_TOTAL != 0) return out;
+    const size_t n = payload.size() / ENTRY_TOTAL;
+    out.reserve(n);
+    for (size_t i=0;i<n;++i) {
+        const uint8_t* base = payload.data() + i*ENTRY_TOTAL;
+        ClientEntry e;
+        std::copy_n(base, 16, e.id.begin());
+        const char* name = reinterpret_cast<const char*>(base + ENTRY_UUID_LEN);
+        size_t len = 0; while (len < ENTRY_NAME_LEN && name[len] != '\0') ++len;
+        e.name.assign(name, len);
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::vector<WaitingMessage> Protocol::parseWaitingMessagesPayload(const std::vector<uint8_t>& payload) {
+    std::vector<WaitingMessage> out;
+    size_t pos = 0;
+    while (pos + 16 + 4 + 1 + 4 <= payload.size()) {
+        WaitingMessage m{};
+        std::copy_n(payload.data()+pos, 16, m.fromId.begin()); pos += 16;
+        m.msgId = rd_u32_le(payload.data()+pos); pos += 4;
+        m.type  = payload[pos++];
+
+        uint32_t mlen = rd_u32_le(payload.data()+pos); pos += 4;
+        if (pos + mlen > payload.size()) { out.clear(); return out; }
+        m.content.assign(payload.begin()+pos, payload.begin()+pos+mlen);
+        pos += mlen;
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+bool Protocol::isSendAck(const ServerReply& r) {
+    // Ack must come from the expected server version, use the SEND_MESSAGE_OK code,
+    // and carry the fixed-length payload required by the spec.
+    return r.version == SERVER_VERSION_EXPECTED
+        && r.code    == CODE_SEND_MESSAGE_OK
+        && r.payloadSize == SEND_ACK_LEN;
+}
+
+

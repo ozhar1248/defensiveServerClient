@@ -1,10 +1,12 @@
 #pragma once
+#include <vector>    
+#include <array>     
+#include <cstdint>
 #include <string>
 #include <optional>
 
 class Message {
 public:
-    // Fields mirror server table (ID may be unknown on the client side)
     std::optional<int> id;
     std::optional<int> toClient;
     std::optional<int> fromClient;
@@ -16,5 +18,17 @@ public:
             std::optional<int> fromClient = std::nullopt,
             std::optional<int> id = std::nullopt);
 
-    // later we can add encode()/decode() if we choose a wire protocol
+};
+
+struct MessageEnvelope {
+    std::array<uint8_t,16> fromId;
+    uint32_t id;
+    uint8_t type; 
+    std::vector<uint8_t> content;
+    static const char* typeName(uint8_t t) {
+        switch(t){case 1: return "Request for symmetric key";
+                   case 2: return "Symmetric key";
+                   case 3: return "Text";
+                   default: return "Unknown";}
+    }
 };
