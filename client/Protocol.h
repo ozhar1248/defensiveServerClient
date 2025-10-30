@@ -20,13 +20,13 @@ constexpr uint16_t CODE_PUBLIC_KEY_OK    = 2102;
 
 constexpr size_t CLIENT_ID_LEN = 16;
 constexpr size_t REG_NAME_LEN  = 255;
-constexpr size_t REG_PUB_LEN   = 160;
+constexpr size_t REG_PUB_LEN   = 400; // couldn't make it with 160
 
 constexpr size_t ENTRY_UUID_LEN = 16;
 constexpr size_t ENTRY_NAME_LEN = 255;
 constexpr size_t ENTRY_TOTAL    = ENTRY_UUID_LEN + ENTRY_NAME_LEN; // 271
 
-constexpr size_t RESP_PUBKEY_LEN = 160;
+constexpr size_t RESP_PUBKEY_LEN = 400; // couldn't make it with 160
 
 constexpr uint16_t CODE_SEND_MESSAGE_REQ = 603;
 constexpr uint16_t CODE_SEND_MESSAGE_OK  = 2103;

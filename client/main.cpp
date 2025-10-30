@@ -14,19 +14,28 @@
 #include <algorithm>
 #include <cctype>
 #include <unordered_map>
+#include <iomanip>
 
-#include <osrng.h>
-#include <cryptopp/osrng.h>
-#include <cryptopp/hex.h>
-#include <cryptopp/aes.h>
-#include <cryptopp/modes.h>
-#include <cryptopp/filters.h>
-#include <cryptopp/rsa.h>
-#include <cryptopp/base64.h>
-#include <cryptopp/files.h>
-#include <cryptopp/pssr.h>
-#include <cryptopp/cryptlib.h>
-#include <cryptopp/secblock.h>
+// DEBUG
+static void dump_hex_prefix(const std::vector<uint8_t> &v, size_t n = 16)
+{
+    std::ios old(nullptr);
+    old.copyfmt(std::cout);
+    std::cout << std::hex;
+    size_t lim = std::min(n, v.size());
+    for (size_t i = 0; i < lim; ++i)
+    {
+        std::cout << (i ? " " : "") << std::setw(2) << std::setfill('0') << (int)v[i];
+    }
+    std::cout << std::dec;
+    std::cout.copyfmt(old);
+}
+// static void dump_hex_prefix_bytes(const uint8_t *p, size_t len, size_t n = 16)
+// {
+//     std::vector<uint8_t> tmp(p, p + std::min(len, n));
+//     dump_hex_prefix(tmp, n);
+// }
+// END DEBUG
 
 // Helpers to locate exe dir and my.info
 static std::filesystem::path exeDir()
@@ -57,18 +66,6 @@ static bool myInfoExists()
 {
     return std::filesystem::exists(myInfoPath());
 }
-static void saveMyInfo(const std::string &name, const std::array<uint8_t, 16> &id)
-{
-    std::ofstream out(myInfoPath(), std::ios::binary | std::ios::trunc);
-    out << name << "\n";
-    // store UUID as 16 raw bytes on line 2 in hex
-    static const char *hex = "0123456789abcdef";
-    for (auto b : id)
-    {
-        out << hex[(b >> 4) & 0xF] << hex[b & 0xF];
-    }
-    out << "\n";
-}
 
 static std::array<uint8_t, 16> zeroClientId()
 {
@@ -90,34 +87,21 @@ static void showMenu()
                  "0) Exit client\n";
 }
 
-static uint8_t hexNibbleLocal(char c)
+// PeerInfo stores information about each known peer
+// Includes UUID, public key (if fetched), symmetric key (if exchanged)
+typedef std::array<uint8_t, 16> Uuid;
+struct PeerInfo
 {
-    if (c >= '0' && c <= '9')
-        return uint8_t(c - '0');
-    if (c >= 'a' && c <= 'f')
-        return uint8_t(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F')
-        return uint8_t(c - 'A' + 10);
-    return 255;
-}
-static bool parseHex32ToBytes16(const std::string &hex, std::array<uint8_t, 16> &out)
-{
-    if (hex.size() != 32)
-        return false;
-    for (size_t i = 0; i < 16; ++i)
-    {
-        uint8_t hi = hexNibbleLocal(hex[2 * i]);
-        uint8_t lo = hexNibbleLocal(hex[2 * i + 1]);
-        if (hi == 255 || lo == 255)
-            return false;
-        out[i] = uint8_t((hi << 4) | lo);
-    }
-    return true;
-}
+    Uuid id;
+    std::string publicKeyBase64;
+    std::array<uint8_t, 16> symmetricKey;
+    bool hasSymmetricKey = false;
+};
 
-static std::unordered_map<std::string, std::array<uint8_t, 16>> g_nameToId;
-static std::unordered_map<std::string, std::array<uint8_t, 16>> g_symKeys; // 16-byte AES keys
+// Global mapping of username to their info
+static std::unordered_map<std::string, PeerInfo> g_peers;
 
+// Converts a UUID to a 32-character hex string
 static std::string toHex32(const std::array<uint8_t, 16> &id)
 {
     static const char *H = "0123456789abcdef";
@@ -131,57 +115,51 @@ static std::string toHex32(const std::array<uint8_t, 16> &id)
     return s;
 }
 
-static bool resolveUserIdByName(ServerConnection &conn, const std::array<uint8_t, 16> &myId,
-                                const std::string &name, std::array<uint8_t, 16> &outId,
-                                std::function<bool(const uint8_t *, int)> readAllFn)
+// Fetches the client list from the server and caches it in g_peers
+void fetchClientList(ServerConnection &conn, const Uuid &myId)
 {
-    auto it = g_nameToId.find(name);
-    if (it != g_nameToId.end())
-    {
-        outId = it->second;
-        return true;
-    }
-
-    // fetch fresh list (reuse code path 120 silently)
     auto req = Protocol::buildClientsListReq(myId);
-    int sent = 0;
-    while (sent < (int)req.size())
-    {
-        int s = send(conn.getSocket(), (const char *)req.data() + sent, (int)req.size() - sent, 0);
-        if (s <= 0)
-            return false;
-        sent += s;
-    }
+    send(conn.getSocket(), (const char *)req.data(), req.size(), 0);
     uint8_t hdr[7];
-    if (!readAllFn(hdr, 7))
-        return false;
+    recv(conn.getSocket(), (char *)hdr, 7, 0);
     auto rep = Protocol::parseServerReplyHeader(hdr);
-    if (rep.code != CODE_CLIENTS_LIST_OK)
-        return false;
     std::vector<uint8_t> payload(rep.payloadSize);
-    if (rep.payloadSize && !readAllFn(payload.data(), (int)payload.size()))
-        return false;
-    if (payload.size() % ENTRY_TOTAL)
-        return false;
+    recv(conn.getSocket(), (char *)payload.data(), payload.size(), 0);
 
-    size_t n = payload.size() / ENTRY_TOTAL;
-    for (size_t i = 0; i < n; ++i)
+    g_peers.clear();
+    size_t count = payload.size() / ENTRY_TOTAL;
+    for (size_t i = 0; i < count; ++i)
     {
         const uint8_t *base = payload.data() + i * ENTRY_TOTAL;
-        std::array<uint8_t, 16> id{};
-        std::copy_n(base, 16, id.data());
-        const char *nm = (const char *)(base + 16);
-        size_t len = 0;
-        while (len < ENTRY_NAME_LEN && nm[len] != '\0')
-            ++len;
-        std::string uname(nm, len);
-        g_nameToId[uname] = id;
+        PeerInfo info;
+        std::copy_n(base, 16, info.id.begin());
+        const char *nameField = reinterpret_cast<const char *>(base + 16);
+        std::string name(nameField, strnlen(nameField, ENTRY_NAME_LEN));
+        g_peers[name] = info;
     }
-    auto it2 = g_nameToId.find(name);
-    if (it2 == g_nameToId.end())
-        return false;
-    outId = it2->second;
-    return true;
+
+    std::cout << "Registered clients:\n";
+    for (const auto &[name, _] : g_peers)
+    {
+        std::cout << " - " << name << "\n";
+    }
+}
+
+// Resolves sender name based on UUID (used in message listing)
+std::string resolveSenderName(const Uuid &id, ServerConnection &conn, const Uuid &myId)
+{
+    for (const auto &[name, peer] : g_peers)
+    {
+        if (peer.id == id)
+            return name;
+    }
+    fetchClientList(conn, myId); // Refresh and try again
+    for (const auto &[name, peer] : g_peers)
+    {
+        if (peer.id == id)
+            return name;
+    }
+    return "<unknown:" + toHex32(id) + ">";
 }
 
 int main()
@@ -236,23 +214,17 @@ int main()
             std::cout << "Enter username (ASCII, <=255): ";
             if (!std::getline(std::cin, username))
                 continue;
-            auto cid = zeroClientId();
-            CryptoPP::RSA::PrivateKey privateKey;
-            std::string publicKeyBase64;
+            if (username.empty())
+            {
+                std::cerr << "Username cannot be empty.\n";
+                continue;
+            }
 
+            auto cid = zeroClientId();
+            Encryption::RsaKeyPair kp;
             try
             {
-
-                CryptoPP::AutoSeededRandomPool rng;
-                privateKey.GenerateRandomWithKeySize(rng, 1024);
-                CryptoPP::RSA::PublicKey publicKey(privateKey);
-
-                // Export public key in X.509 Base64 format
-                CryptoPP::ByteQueue pubQueue;
-                publicKey.DEREncode(pubQueue);
-                CryptoPP::Base64Encoder pubEncoder(new CryptoPP::StringSink(publicKeyBase64), false);
-                pubQueue.CopyTo(pubEncoder);
-                pubEncoder.MessageEnd();
+                kp = Encryption::GenerateRsaKeypair1024();
             }
             catch (const std::exception &ex)
             {
@@ -260,7 +232,8 @@ int main()
                 continue;
             }
 
-            auto req = Protocol::buildRegistration(cid, username, publicKeyBase64);
+            auto req = Protocol::buildRegistration(cid, username, kp.publicKeyBase64);
+
             // send request bytes
             int sent = 0;
             while (sent < (int)req.size())
@@ -285,6 +258,10 @@ int main()
                 continue;
             }
             auto reply = Protocol::parseServerReplyHeader(hdr);
+            // debug
+            std::cout << "[DBG] reg reply code=" << reply.code
+                      << " payloadSize=" << reply.payloadSize << "\n";
+            // end debug
 
             // read payload
             std::vector<uint8_t> payload(reply.payloadSize);
@@ -303,16 +280,7 @@ int main()
 
                 try
                 {
-                    // Convert the private key to Base64 DER format
-                    std::string privateKeyBase64;
-                    CryptoPP::ByteQueue privQueue;
-                    privateKey.DEREncode(privQueue);
-                    CryptoPP::Base64Encoder privEncoder(new CryptoPP::StringSink(privateKeyBase64), false);
-                    privQueue.CopyTo(privEncoder);
-                    privEncoder.MessageEnd();
-
-                    // Write to my.info
-                    FileConfig::writeMyInfo(username, uid, privateKeyBase64);
+                    FileConfig::writeMyInfo(username, uid, kp.privateKeyBase64);
                     std::cout << "Registration successful. my.info created.\n";
                 }
                 catch (const std::exception &ex)
@@ -403,16 +371,20 @@ int main()
             }
 
             std::cout << "Registered clients:\n";
+            g_peers.clear(); // Clear old list before re-caching
             for (size_t i = 0; i < count; ++i)
             {
                 const uint8_t *base = payload.data() + i * ENTRY_TOTAL;
-                // skip 16-byte UUID: base[0..15]
+                std::array<uint8_t, 16> id{};
+                std::copy_n(base, 16, id.data());
                 const char *nameField = reinterpret_cast<const char *>(base + ENTRY_UUID_LEN);
-                // find NUL terminator within 255 bytes
                 size_t len = 0;
                 while (len < ENTRY_NAME_LEN && nameField[len] != '\0')
                     ++len;
                 std::string username(nameField, len);
+                PeerInfo info;
+                info.id = id;
+                g_peers[username] = info;
                 std::cout << " - " << username << "\n";
             }
         }
@@ -433,21 +405,20 @@ int main()
                 continue;
             }
 
-            std::string targetHex;
-            std::cout << "Enter target client's 16-byte ID in hex (32 hex chars, no dashes): ";
-            if (!std::getline(std::cin, targetHex))
+            std::string targetUsername;
+            std::cout << "Enter destination username: ";
+            if (!std::getline(std::cin, targetUsername))
                 continue;
 
-            std::array<uint8_t, 16> targetId{};
-            if (!parseHex32ToBytes16(targetHex, targetId))
+            auto it = g_peers.find(targetUsername);
+            if (it == g_peers.end())
             {
-                std::cerr << "Invalid hex format.\n";
+                std::cerr << "Error: Username not found in cached client list. Run 120 first.\n";
                 continue;
             }
-
+            std::array<uint8_t, 16> targetId = it->second.id;
             auto req = Protocol::buildPublicKeyReq(myId, targetId);
 
-            // send request
             int sent = 0;
             while (sent < (int)req.size())
             {
@@ -463,42 +434,33 @@ int main()
             if (sent != (int)req.size())
                 continue;
 
-            // read reply header
             uint8_t hdr[7];
             if (!readAll(conn.getSocket(), hdr, 7))
             {
                 std::cerr << "server responded with an error\n";
                 continue;
             }
+
             auto reply = Protocol::parseServerReplyHeader(hdr);
-
-            // read payload
             std::vector<uint8_t> payload(reply.payloadSize);
-            if (reply.payloadSize > 0)
-            {
-                if (!readAll(conn.getSocket(), payload.data(), (int)payload.size()))
-                {
-                    std::cerr << "server responded with an error\n";
-                    continue;
-                }
-            }
-
-            if (reply.version != SERVER_VERSION_EXPECTED || reply.code == CODE_ERROR)
-            {
-                std::cerr << "server responded with an error\n";
-                continue;
-            }
-            if (reply.code != CODE_PUBLIC_KEY_OK || reply.payload.size() != (16 + RESP_PUBKEY_LEN))
+            if (reply.payloadSize > 0 &&
+                !readAll(conn.getSocket(), payload.data(), (int)payload.size()))
             {
                 std::cerr << "server responded with an error\n";
                 continue;
             }
 
-            // parse response: first 16 bytes = client id, next 160 = ASCII public key (NUL-padded)
-            const uint8_t *base = payload.data();
-            // const uint8_t* idBytes = base;  // (we already know target; you could check equality)
-            const char *keyField = reinterpret_cast<const char *>(base + 16);
+            // debug
+            std::cout << "[DBG] pubkey reply code=" << reply.code
+                      << " payloadSize=" << reply.payloadSize << "\n";
+            // end debug
+            if (reply.version != SERVER_VERSION_EXPECTED || reply.code != CODE_PUBLIC_KEY_OK || payload.size() != (16 + RESP_PUBKEY_LEN))
+            {
+                std::cerr << "server responded with an error\n";
+                continue;
+            }
 
+            const char *keyField = reinterpret_cast<const char *>(payload.data() + 16);
             size_t keyLen = RESP_PUBKEY_LEN;
             for (size_t i = 0; i < RESP_PUBKEY_LEN; ++i)
             {
@@ -509,8 +471,24 @@ int main()
                 }
             }
             std::string pubKey(keyField, keyLen);
-            std::cout << "Public key: " << pubKey << "\n";
+            // Validate that pubKey contains only valid base64 characters
+            if (pubKey.empty() || pubKey.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n") != std::string::npos)
+            {
+                std::cerr << "Invalid Base64 format for public key. Aborting.\n";
+                continue;
+            }
+
+            g_peers[targetUsername].publicKeyBase64 = pubKey;
+            // DEBUG
+            std::cout << "[DBG] pubkey len (base64): " << pubKey.size() << "\n";
+            if (!pubKey.empty())
+            {
+                std::cout << "[DBG] pubkey prefix: " << pubKey.substr(0, 32) << "...\n";
+            }
+            // end debug
+            std::cout << "Public key for " << targetUsername << " successfully cached.\n";
         }
+
         else if (choice == "150")
         {
             // requires registration
@@ -533,29 +511,26 @@ int main()
             if (!std::getline(std::cin, toName))
                 continue;
 
-            std::array<uint8_t, 16> toId{};
-            if (!resolveUserIdByName(conn, myId, toName, toId,
-                                     [&](const uint8_t *buf, int n)
-                                     { return readAll(conn.getSocket(), (uint8_t *)buf, n); }))
+            auto it = g_peers.find(toName);
+            if (it == g_peers.end())
             {
-                std::cerr << "server responded with an error\n";
+                std::cerr << "User not found. Please run option 120 to refresh list.\n";
                 continue;
             }
+            std::array<uint8_t, 16> toId = it->second.id;
 
             std::string text;
             std::cout << "Enter message text: ";
             if (!std::getline(std::cin, text))
                 continue;
 
-            // must have symmetric key for this peer
-            auto kit = g_symKeys.find(toName);
-            if (kit == g_symKeys.end())
+            if (it == g_peers.end() || !it->second.hasSymmetricKey)
             {
-                std::cerr << "can't decrypt/encrypt: no symmetric key. Use 151/152 first.\n";
+                std::cerr << "can't encrypt: no symmetric key. Use 151/152 first.\n";
                 continue;
             }
             std::vector<uint8_t> plain(text.begin(), text.end());
-            auto cipher = Encryption::AesCbcEncryptZeroIV(kit->second, plain);
+            auto cipher = Encryption::AesCbcEncryptZeroIV(it->second.symmetricKey, plain);
 
             auto req = Protocol::buildSendMessageReq(myId, toId, /*type*/ 3, cipher);
             int sent = 0;
@@ -613,14 +588,13 @@ int main()
             if (!std::getline(std::cin, toName))
                 continue;
 
-            std::array<uint8_t, 16> toId{};
-            if (!resolveUserIdByName(conn, myId, toName, toId,
-                                     [&](const uint8_t *buf, int n)
-                                     { return readAll(conn.getSocket(), (uint8_t *)buf, n); }))
+            auto it = g_peers.find(toName);
+            if (it == g_peers.end())
             {
-                std::cerr << "server responded with an error\n";
+                std::cerr << "User not found. Please run option 120 to refresh list.\n";
                 continue;
             }
+            std::array<uint8_t, 16> toId = it->second.id;
 
             std::vector<uint8_t> empty;
             auto req = Protocol::buildSendMessageReq(myId, toId, /*type*/ 1, empty);
@@ -679,71 +653,50 @@ int main()
             if (!std::getline(std::cin, toName))
                 continue;
 
-            std::array<uint8_t, 16> toId{};
-            if (!resolveUserIdByName(conn, myId, toName, toId,
-                                     [&](const uint8_t *buf, int n)
-                                     { return readAll(conn.getSocket(), (uint8_t *)buf, n); }))
+            auto it = g_peers.find(toName);
+            if (it == g_peers.end())
             {
-                std::cerr << "server responded with an error\n";
+                std::cerr << "User not found. Please run option 120 to refresh list.\n";
                 continue;
             }
+            std::array<uint8_t, 16> toId = it->second.id;
 
             // fetch public key of destination (602)
-            auto preq = Protocol::buildPublicKeyReq(myId, toId);
-            int psent = 0;
-            while (psent < (int)preq.size())
+            if (g_peers[toName].publicKeyBase64.empty())
             {
-                int s = send(conn.getSocket(), (const char *)preq.data() + psent, (int)preq.size() - psent, 0);
-                if (s <= 0)
-                {
-                    std::cerr << "send() failed: " << WSAGetLastError() << "\n";
-                    break;
-                }
-                psent += s;
-            }
-            if (psent != (int)preq.size())
-                continue;
-            uint8_t phdr[7];
-            if (!readAll(conn.getSocket(), phdr, 7))
-            {
-                std::cerr << "server responded with an error\n";
+                std::cerr << "Missing public key. Use option 130 first.\n";
                 continue;
             }
-            auto prep = Protocol::parseServerReplyHeader(phdr);
-            std::vector<uint8_t> ppayload(prep.payloadSize);
-            if (prep.payloadSize && !readAll(conn.getSocket(), ppayload.data(), (int)ppayload.size()))
-            {
-                std::cerr << "server responded with an error\n";
-                continue;
-            }
-            if (prep.version != SERVER_VERSION_EXPECTED || prep.code != CODE_PUBLIC_KEY_OK || ppayload.size() < 16)
-            {
-                std::cerr << "server responded with an error\n";
-                continue;
-            }
-            // parse pubkey (next 160 bytes, NUL-padded)
-            const char *kf = (const char *)(ppayload.data() + 16);
-            size_t klen = std::min<size_t>(RESP_PUBKEY_LEN, prep.payloadSize - 16);
-            size_t term = klen;
-            for (size_t i = 0; i < klen; ++i)
-            {
-                if (kf[i] == '\0')
-                {
-                    term = i;
-                    break;
-                }
-            }
-            std::string peerPub(kf, term);
 
             // symmetric key (generate or reuse)
-            auto it = g_symKeys.find(toName);
-            if (it == g_symKeys.end())
+            auto &peer = g_peers[toName];
+            if (!peer.hasSymmetricKey)
             {
-                g_symKeys[toName] = Encryption::GenerateAesKey();
-                it = g_symKeys.find(toName);
+                peer.symmetricKey = Encryption::GenerateAesKey();
+                peer.hasSymmetricKey = true;
             }
-            std::vector<uint8_t> keyRaw(it->second.begin(), it->second.end());
-            auto keyEnc = Encryption::RsaEncryptOaepWithBase64X509Pub(peerPub, keyRaw);
+            std::vector<uint8_t> keyRaw(peer.symmetricKey.begin(), peer.symmetricKey.end());
+
+            std::vector<uint8_t> keyEnc;
+            try
+            {
+                // peer public key is already cached in g_peers[toName].publicKeyBase64
+                keyEnc = Encryption::RsaEncryptOaepWithBase64Pub(
+                    g_peers[toName].publicKeyBase64,
+                    keyRaw // this is the std::vector<uint8_t> you created from the 16-byte AES key
+                );
+                // DEBUG
+                std::cout << "[DBG] RSA ciphertext size: " << keyEnc.size() << " (expect 128 for RSA-1024)\n";
+                std::cout << "[DBG] RSA ciphertext prefix: ";
+                dump_hex_prefix(keyEnc);
+                std::cout << "\n";
+                // END debug
+            }
+            catch (const std::exception &ex)
+            {
+                std::cerr << "Encryption error: " << ex.what() << "\n";
+                continue;
+            }
 
             auto req = Protocol::buildSendMessageReq(myId, toId, /*type*/ 2, keyEnc);
             int sent = 0;
@@ -855,16 +808,15 @@ int main()
                 std::vector<uint8_t> mcontent(payload.begin() + pos, payload.begin() + pos + mlen);
                 pos += mlen;
 
-                // resolve name (try cache, else show hex)
-                std::string fromName = "<unknown>";
-                for (const auto &kv : g_nameToId)
-                    if (kv.second == fromId)
-                    {
-                        fromName = kv.first;
-                        break;
-                    }
-                if (fromName == "<unknown>")
-                    fromName = toHex32(fromId);
+                // DEBUG: message header
+                std::cout << "[DBG] msg type=" << (int)mtype
+                          << " len=" << mlen << " from=" << toHex32(fromId) << "\n";
+                std::cout << "[DBG] content prefix (hex): ";
+                dump_hex_prefix(mcontent);
+                std::cout << "\n";
+                // END DEBUG
+                //  resolve name (try cache, else show hex)
+                std::string fromName = resolveSenderName(fromId, conn, myId);
 
                 std::cout << "From: " << fromName << "\nContent:\n";
                 if (mtype == 1)
@@ -876,34 +828,46 @@ int main()
                     std::cout << "symmetric key received\n";
                     try
                     {
-                        // 1. Load my private key from my.info
-                        auto [myName, myId, myBase64] = FileConfig::readFullMyInfo();
+                        // Load my private key (Base64 DER) from my.info
+                        auto [myName2, myId2, myBase64] = FileConfig::readFullMyInfo();
+                        //DEBUG
+                         std::cout << "[DBG] SYM-KEY message len: " << mcontent.size()
+                                  << " (expect 128 for RSA-1024)\n";
+                        if (mcontent.size() != 128)
+                        {
+                            std::cerr << "[DBG] WARNING: ciphertext size unexpected; likely not raw RSA block.\n";
+                        }
+                        //END DEBUG
+                        bool ok = false;
+                        
+                        //  Decrypt the received symmetric key (RSA-OAEP)
+                        auto recovered = Encryption::RsaDecryptOaepWithBase64Priv(myBase64, mcontent, ok);
 
-                        // 2. Decode Base64 -> DER -> ByteQueue
-                        CryptoPP::ByteQueue q;
-                        CryptoPP::StringSource ss(myBase64, true, new CryptoPP::Base64Decoder);
-                        ss.TransferTo(q);
-                        q.MessageEnd();
+                        // debug
+                       
 
-                        // 3. Load RSA private key from queue
-                        CryptoPP::RSA::PrivateKey priv;
-                        priv.BERDecodePrivateKey(q, false, q.MaxRetrievable());
+                        // after decryption call:
+                        std::cout << "[DBG] RSA decrypt ok=" << (ok ? "true" : "false")
+                                  << " recovered len=" << recovered.size() << "\n";
+                        if (ok && recovered.size() >= 16)
+                        {
+                            std::cout << "[DBG] recovered key prefix: ";
+                            dump_hex_prefix(recovered);
+                            std::cout << "\n";
+                        }
+                        // END DEBUG
 
-                        // 4. Decrypt the message content (ciphertext) with OAEP-SHA
-                        CryptoPP::AutoSeededRandomPool rng;
-                        CryptoPP::RSAES_OAEP_SHA_Decryptor dec(priv);
-                        std::string recovered;
-                        CryptoPP::StringSource ss2(
-                            mcontent.data(), mcontent.size(), true,
-                            new CryptoPP::PK_DecryptorFilter(rng, dec, new CryptoPP::StringSink(recovered)));
-
-                        // 5. recovered now holds the 16-byte symmetric AES key
-                        if (recovered.size() != 16)
-                            std::cerr << "Warning: unexpected symmetric key size (" << recovered.size() << ")\n";
+                        if (!ok || recovered.size() < 16)
+                        {
+                            std::cerr << "Failed to decrypt symmetric key (invalid data).\n";
+                            continue;
+                        }
 
                         std::array<uint8_t, 16> key{};
-                        std::copy_n(recovered.begin(), std::min<size_t>(16, recovered.size()), key.begin());
-                        g_symKeys[fromName] = key;
+                        std::copy_n(recovered.begin(), 16, key.begin());
+                        g_peers[fromName].symmetricKey = key;
+                        g_peers[fromName].hasSymmetricKey = true;
+
                         std::cout << "Symmetric key stored for " << fromName << ".\n";
                     }
                     catch (const std::exception &ex)
@@ -913,15 +877,16 @@ int main()
                 }
                 else if (mtype == 3)
                 {
-                    auto kit = g_symKeys.find(fromName);
-                    if (kit == g_symKeys.end())
+                    auto it = g_peers.find(fromName);
+                    if (it == g_peers.end() || !it->second.hasSymmetricKey)
                     {
                         std::cout << "can't decrypt message\n";
                     }
                     else
                     {
                         bool ok = false;
-                        auto plain = Encryption::AesCbcDecryptZeroIV(kit->second, mcontent, ok);
+                        auto plain = Encryption::AesCbcDecryptZeroIV(it->second.symmetricKey, mcontent, ok);
+
                         if (!ok)
                             std::cout << "can't decrypt message\n";
                         else

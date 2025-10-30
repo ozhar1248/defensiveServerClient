@@ -26,7 +26,7 @@ CODE_PULL_WAITING_OK   = 2104
 
 # Payload sizes for registration
 REG_NAME_LEN = 255
-REG_PUBKEY_LEN = 160
+REG_PUBKEY_LEN = 400 #/ I couldn't handle 160
 REG_PAYLOAD_LEN = REG_NAME_LEN + REG_PUBKEY_LEN
 
 ENTRY_UUID_LEN = 16
@@ -35,7 +35,7 @@ ENTRY_TOTAL = ENTRY_UUID_LEN + ENTRY_NAME_LEN  # 271
 
 CODE_PUBLIC_KEY_REQ   = 602
 CODE_PUBLIC_KEY_OK    = 2102
-PUBKEY_RESP_KEY_LEN   = 160  # response key length per spec
+PUBKEY_RESP_KEY_LEN   = 400 #/ I couldn't handle 160
 
 @dataclass
 class ClientRequest:
